@@ -1,8 +1,15 @@
 on:
   workflow_call:
+    inputs:
+      OR_VAR:
+        type: string
+        description: 'callee variable'
+        required: false
+        default: 'callee default value'
+
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "hello"
+      - run: echo "hello ${{ github.event.inputs.OR_VAR }}"
