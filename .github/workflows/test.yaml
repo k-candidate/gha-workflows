@@ -9,7 +9,7 @@ on:
 
 
 jobs:
-  deploy:
+  test-callee-job:
     runs-on: ubuntu-latest
     steps:
-      - run: echo "hello ${{ github.event.inputs.OR_VAR }}"
+      - run: echo "hello ${{ inputs.OR_VAR }}"
