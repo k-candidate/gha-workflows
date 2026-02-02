@@ -1,0 +1,284 @@
+name: docker-bake
+
+on:
+  workflow_call:
+    inputs:
+      bake-file:
+        description: 'Bake HCL file path'
+        type: string
+        default: './docker-bake.hcl'
+      group:
+        description: 'Bake group to build'
+        type: string
+        default: 'default'
+      version:
+        description: 'Version string to expose as VERSION env var for bake variable interpolation (e.g. for tagging from a release)'
+        type: string
+        required: false
+      runner-amd64:
+        description: 'Runner to use for amd64 builds'
+        type: string
+        default: 'ubuntu-latest'
+      runner-arm64:
+        description: 'Runner to use for arm64 builds'
+        type: string
+        default: 'ubuntu-24.04-arm'
+    secrets:
+      dockerhub_username:
+        description: 'DockerHub username'
+        required: true
+      dockerhub_token:
+        description: 'DockerHub token'
+        required: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.parse.outputs.matrix }}
+      targets_json: ${{ steps.parse.outputs.targets_json }}
+      needs_merge: ${{ steps.parse.outputs.needs_merge }}
+      instance_id: ${{ steps.parse.outputs.instance_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse bake file and build matrix and target info
+        id: parse
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Unique ID to namespace artifacts when multiple caller jobs invoke this workflow in one run
+          INSTANCE_ID=$(head -c 4 /dev/urandom | xxd -p)
+          echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
+
+          BAKE_JSON=$(docker buildx bake --file ${{ inputs.bake-file }} --print ${{ inputs.group }})
+          TARGET_NAMES=$(echo "$BAKE_JSON" | jq -r --arg group '${{ inputs.group }}' '.group[$group].targets[]')
+
+          MATRIX_ITEMS='[]'
+          TARGETS_INFO='{}'
+
+          for TARGET in $TARGET_NAMES; do
+            PLATFORMS=$(echo "$BAKE_JSON" | jq -r --arg target "$TARGET" '.target[$target].platforms[]?')
+
+            if [ -z "$PLATFORMS" ]; then
+              echo "Warning: Target $TARGET has no platforms, skipping"
+              continue
+            fi
+
+            # Build matrix entries for this target
+            for PLATFORM in $PLATFORMS; do
+              MATRIX_ITEMS=$(echo "$MATRIX_ITEMS" | jq -c --arg target "$TARGET" --arg platform "$PLATFORM" \
+                '. += [{"target": $target, "platform": $platform}]')
+            done
+
+            # Build targets info entry for this target
+            TAGS=$(echo "$BAKE_JSON" | jq -c --arg target "$TARGET" \
+              '[.target[$target].tags[]? | select(test("^[a-zA-Z0-9-._/]+@[a-f0-9]{64}$") | not)]')
+            PLATFORMS_JSON=$(echo "$BAKE_JSON" | jq -c --arg target "$TARGET" \
+              '[.target[$target].platforms[]?]')
+            TARGETS_INFO=$(echo "$TARGETS_INFO" | jq -c --arg target "$TARGET" --argjson tags "$TAGS" --argjson platforms "$PLATFORMS_JSON" \
+              '.[$target] = {"tags": $tags, "platforms": $platforms}')
+          done
+
+          echo "matrix=$MATRIX_ITEMS" >> $GITHUB_OUTPUT
+          echo "targets_json=$TARGETS_INFO" >> $GITHUB_OUTPUT
+
+          # needs_merge is true only if any target has more than one platform
+          NEEDS_MERGE=$(echo "$TARGETS_INFO" | jq '[.[].platforms | length] | any(. > 1)')
+          echo "needs_merge=$NEEDS_MERGE" >> $GITHUB_OUTPUT
+
+          echo "=== Build Matrix ==="
+          echo "$MATRIX_ITEMS" | jq .
+          echo "=== Targets Info ==="
+          echo "$TARGETS_INFO" | jq .
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ startsWith(matrix.platform, 'linux/arm') && inputs.runner-arm64 || inputs.runner-amd64 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare
+        run: |
+          platform=${{ matrix.platform }}
+          echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        id: bake
+        env:
+          VERSION: ${{ inputs.version }}
+        uses: docker/bake-action@v6
+        with:
+          files: ${{ inputs.bake-file }}
+          targets: ${{ matrix.target }}
+          set: |
+            *.platform=${{ matrix.platform }}
+            *.output=type=image,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p ${{ runner.temp }}/digests
+          # Extract containerimage.digest for this target from bake metadata
+          DIGEST=$(echo '${{ steps.bake.outputs.metadata }}' | \
+            jq -r --arg target '${{ matrix.target }}' \
+            '.[$target]["containerimage.digest"] // empty' | \
+            sed 's/^sha256://')
+          if [ -z "$DIGEST" ]; then
+            echo "ERROR: No digest found for target=${{ matrix.target }} platform=${{ matrix.platform }}"
+            echo "Raw metadata:"
+            echo '${{ steps.bake.outputs.metadata }}' | jq .
+            exit 1
+          fi
+          echo "$DIGEST" > ${{ runner.temp }}/digests/digest.txt
+          echo "Exported digest for ${{ matrix.target }}/${{ matrix.platform }}: $DIGEST"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ needs.prepare.outputs.instance_id }}-${{ matrix.target }}-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    if: ${{ needs.prepare.outputs.needs_merge == 'true' }}
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - build
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/artifacts
+          pattern: digests-${{ needs.prepare.outputs.instance_id }}-*
+          merge-multiple: false
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create manifest lists and push
+        run: |
+          # Parse the targets info JSON
+          TARGETS_INFO='${{ needs.prepare.outputs.targets_json }}'
+          
+          echo "=== Targets Info ==="
+          echo "$TARGETS_INFO" | jq .
+          
+          # Get all target names
+          TARGETS=$(echo "$TARGETS_INFO" | jq -r 'keys[]')
+          
+          # Process each target
+          for TARGET in $TARGETS; do
+            echo ""
+            echo "=== Processing target: $TARGET ==="
+            
+            # Get tags for this target
+            TAGS=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].tags[]')
+            
+            # Get platforms for this target
+            PLATFORMS=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].platforms[]')
+            
+            # Count platforms to determine if we need multi-platform manifest
+            PLATFORM_COUNT=$(echo "$PLATFORMS" | wc -l)
+            
+            echo "Tags for $TARGET:"
+            echo "$TAGS"
+            echo "Platforms: $PLATFORM_COUNT"
+            
+            # Build list of digest sources for this target
+            SOURCES=()
+            for PLATFORM in $PLATFORMS; do
+              PLATFORM_PAIR="${PLATFORM//\//-}"
+              DIGEST_FILE="${{ runner.temp }}/artifacts/digests-${{ needs.prepare.outputs.instance_id }}-${TARGET}-${PLATFORM_PAIR}/digest.txt"
+              
+              if [ -f "$DIGEST_FILE" ]; then
+                DIGEST=$(cat "$DIGEST_FILE" | tr -d '\n\r')
+                if [ ${#DIGEST} -eq 64 ]; then
+                  # Add source for each tag
+                  for TAG in $TAGS; do
+                    SOURCES+=("$TAG@sha256:$DIGEST")
+                  done
+                  echo "  Found digest for $PLATFORM: $DIGEST"
+                else
+                  echo "  Warning: Invalid digest in $DIGEST_FILE"
+                fi
+              else
+                echo "  Warning: Digest file not found: $DIGEST_FILE"
+              fi
+            done
+            
+            echo "Total sources collected: ${#SOURCES[@]}"
+            
+            # Create manifest for each tag in this target
+            if [ $PLATFORM_COUNT -gt 1 ]; then
+              # Multi-platform: create manifest list
+              for TAG in $TAGS; do
+                echo ""
+                echo "Creating multi-platform manifest for: $TAG"
+                
+                # Filter sources for this specific tag
+                TAG_SOURCES=()
+                for src in "${SOURCES[@]}"; do
+                  if [[ "$src" == "$TAG@sha256:"* ]]; then
+                    TAG_SOURCES+=("$src")
+                  fi
+                done
+                
+                if [ ${#TAG_SOURCES[@]} -gt 0 ]; then
+                  echo "  Sources:"
+                  printf '    %s\n' "${TAG_SOURCES[@]}"
+                  docker buildx imagetools create -t "$TAG" "${TAG_SOURCES[@]}"
+                  echo "  ✓ Manifest created"
+                else
+                  echo "  ✗ No sources found"
+                fi
+              done
+            else
+              # Single platform: image already pushed during build, manifest not needed.
+              # Inspect step below will still verify it.
+              echo "Single platform build - images already pushed during build step"
+              for TAG in $TAGS; do
+                echo "  ✓ Image available: $TAG"
+              done
+            fi
+          done
+
+      - name: Inspect images
+        run: |
+          TARGETS_INFO='${{ needs.prepare.outputs.targets_json }}'
+          TARGETS=$(echo "$TARGETS_INFO" | jq -r 'keys[]')
+          
+          for TARGET in $TARGETS; do
+            echo ""
+            echo "=== Inspecting images for target: $TARGET ==="
+            
+            TAGS=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].tags[]')
+            
+            for TAG in $TAGS; do
+              echo ""
+              echo "Image: $TAG"
+              docker buildx imagetools inspect "$TAG" || echo "Failed to inspect $TAG"
+            done
+          done
