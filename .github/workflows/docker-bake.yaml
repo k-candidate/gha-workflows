@@ -44,7 +44,7 @@ jobs:
         with:
           repository: k-candidate/gha-workflows
           path: .pipeline
-          ref: ${{ github.ref }}
+          ref: refs/heads/b2
       
       - name: Verify caller authorization
         run: |
