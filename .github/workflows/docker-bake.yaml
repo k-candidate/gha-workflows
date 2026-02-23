@@ -51,6 +51,13 @@ jobs:
           CALLER="${{ github.repository }}"
           ALLOWLIST_FILE=".github/config/allowed-callers.txt"
           
+          echo "::group::Debug checkout contents"
+          pwd
+          ls -la .github/ || echo "No .github dir"
+          ls -la .github/config/ || echo "No config dir"  
+          ls -la .github/config/allowed-callers.txt || echo "No allowlist file"
+          echo "::endgroup::"
+
           echo "::group::Authorization Check"
           echo "Caller: $CALLER"
           echo "Actor: ${{ github.actor }}"
