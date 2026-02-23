@@ -27,13 +27,6 @@ on:
         description: 'Path to .trivyignore file (relative to calling repo)'
         type: string
         default: '.trivyignore'
-    secrets:
-      dockerhub_username:
-        description: 'DockerHub username'
-        required: false
-      dockerhub_token:
-        description: 'DockerHub token'
-        required: false
 
 jobs:
   verify-caller:
