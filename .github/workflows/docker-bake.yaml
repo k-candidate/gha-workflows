@@ -48,7 +48,7 @@ jobs:
       - name: Verify caller authorization
         run: |
           CALLER="${{ github.repository }}"
-          ALLOWLIST_FILE=".pipeline/.github/config/allowed-callers.txt"
+          ALLOWLIST_FILE=".github/config/allowed-callers.txt"
           
           echo "::group::Authorization Check"
           echo "Caller: $CALLER"
