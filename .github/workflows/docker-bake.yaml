@@ -485,10 +485,10 @@ jobs:
       - name: Fetch signing key from Infisical
         uses: Infisical/secrets-action@v1.0.15
         with:
-          method: universal-auth
+          method: universal
           client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
           client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
-          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
+          # project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           env-slug: prod
           project-slug: ${{ secrets.INFISICAL_PROJECT_SLUG }}
           secret-path: /
