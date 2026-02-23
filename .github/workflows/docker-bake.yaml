@@ -34,18 +34,6 @@ on:
       dockerhub_token:
         description: 'DockerHub token'
         required: true
-      infisical_client_id:
-        description: 'Infisical client ID for signing key'
-        required: true
-      infisical_client_secret:
-        description: 'Infisical client secret for signing key'
-        required: true
-      infisical_project_id:
-        description: 'Infisical project ID'
-        required: true
-      infisical_project_slug:
-        description: 'Infisical project slug'
-        required: true
 
 jobs:
   verify-caller:
@@ -490,11 +478,11 @@ jobs:
         uses: Infisical/secrets-action@v1.0.7
         with:
           method: universal-auth
-          client-id: ${{ secrets.infisical_client_id }}
-          client-secret: ${{ secrets.infisical_client_secret }}
-          project-id: ${{ secrets.infisical_project_id }}
+          client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
+          client-secret: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+          project-id: ${{ secrets.INFISICAL_PROJECT_ID }}
           env-slug: prod
-          project-slug: ${{ secrets.infisical_project_slug }}
+          project-slug: ${{ secrets.INFISICAL_PROJECT_SLUG }}
           secret-path: /
       
       - name: Verify signing key fetched
