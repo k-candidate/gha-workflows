@@ -1,0 +1,7 @@
+# Repositories authorized to use the docker-bake pipeline
+# Format: org/repo (one per line)
+# Managed by: DevSecOps team
+# Changes require approval per CODEOWNERS
+
+k-candidate/example-app
+k-candidate/gha-test

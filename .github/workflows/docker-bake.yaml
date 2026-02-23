@@ -23,6 +23,10 @@ on:
         description: 'Runner to use for arm64 builds'
         type: string
         default: 'ubuntu-24.04-arm'
+      trivyignore-path:
+        description: 'Path to .trivyignore file (relative to calling repo)'
+        type: string
+        default: '.trivyignore'
     secrets:
       dockerhub_username:
         description: 'DockerHub username'
@@ -30,9 +34,61 @@ on:
       dockerhub_token:
         description: 'DockerHub token'
         required: true
+      infisical_client_id:
+        description: 'Infisical client ID for signing key'
+        required: true
+      infisical_client_secret:
+        description: 'Infisical client secret for signing key'
+        required: true
+      infisical_project_id:
+        description: 'Infisical project ID'
+        required: true
+      infisical_project_slug:
+        description: 'Infisical project slug'
+        required: true
 
 jobs:
+  verify-caller:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pipeline repo
+        uses: actions/checkout@v4
+        with:
+          repository: k-candidate/gha-workflows
+          path: .pipeline
+      
+      - name: Verify caller authorization
+        run: |
+          CALLER="${{ github.repository }}"
+          ALLOWLIST_FILE=".pipeline/.github/config/allowed-callers.txt"
+          
+          echo "::group::Authorization Check"
+          echo "Caller: $CALLER"
+          echo "Actor: ${{ github.actor }}"
+          echo "Workflow Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          echo "::endgroup::"
+
+          if [ ! -f "$ALLOWLIST_FILE" ]; then
+            echo "::error::Allowlist file not found: $ALLOWLIST_FILE"
+            exit 1
+          fi
+          
+          # Read allowlist, strip comments and empty lines
+          ALLOWED_REPOS=$(grep -v '^#' "$ALLOWLIST_FILE" | grep -v '^$' || true)
+          
+          if echo "$ALLOWED_REPOS" | grep -q "^${CALLER}$"; then
+            echo "::notice::✅ Repository $CALLER is authorized"
+          else
+            echo "::error::❌ Repository $CALLER is NOT authorized to use this pipeline"
+            echo "::group::Authorized Repositories"
+            cat "$ALLOWLIST_FILE"
+            echo "::endgroup::"
+            exit 1
+          fi
+
   prepare:
+    needs: verify-caller
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.parse.outputs.matrix }}
@@ -126,6 +182,7 @@ jobs:
         with:
           files: ${{ inputs.bake-file }}
           targets: ${{ matrix.target }}
+          provenance: mode=max
           set: |
             *.platform=${{ matrix.platform }}
             *.output=type=image,push=true
@@ -282,3 +339,292 @@ jobs:
               docker buildx imagetools inspect "$TAG" || echo "Failed to inspect $TAG"
             done
           done
+
+  scan:
+    needs: [prepare, build, merge]
+    if: |
+      always() && 
+      needs.prepare.result == 'success' && 
+      needs.build.result == 'success' && 
+      (needs.merge.result == 'success' || needs.merge.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout calling repo
+        uses: actions/checkout@v4
+      
+      - name: Install Trivy
+        run: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install trivy
+      
+      - name: Check for trivyignore file
+        id: trivyignore
+        run: |
+          if [ -f "${{ inputs.trivyignore-path }}" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "::group::Trivy Ignore File Content"
+            cat "${{ inputs.trivyignore-path }}"
+            echo "::endgroup::"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "::notice::No .trivyignore file found at ${{ inputs.trivyignore-path }}"
+          fi
+      
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+      
+      - name: Scan images with Trivy
+        run: |
+          TARGETS_INFO='${{ needs.prepare.outputs.targets_json }}'
+          TARGETS=$(echo "$TARGETS_INFO" | jq -r 'keys[]')
+          
+          SCAN_FAILED=0
+          
+          for TARGET in $TARGETS; do
+            echo "::group::Scanning target: $TARGET"
+            
+            # Get first tag for this target
+            TAG=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].tags[0]')
+            PLATFORMS=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].platforms[]')
+            
+            for PLATFORM in $PLATFORMS; do
+              echo ""
+              echo "=== Scanning $TAG @ $PLATFORM ==="
+              
+              PLATFORM_PAIR="${PLATFORM//\//-}"
+              VULN_FILE="vuln-${TARGET}-${PLATFORM_PAIR}.json"
+              SBOM_FILE="sbom-${TARGET}-${PLATFORM_PAIR}.json"
+              
+              # Build Trivy command with conditional ignorefile
+              TRIVY_CMD="trivy image \
+                --platform $PLATFORM \
+                --severity CRITICAL,HIGH,MEDIUM,LOW \
+                --exit-code 1 \
+                --ignore-unfixed \
+                --show-suppressed \
+                --scanners vuln,config,secret \
+                --format cosign-vuln \
+                --output $VULN_FILE"
+              
+              if [ "${{ steps.trivyignore.outputs.exists }}" = "true" ]; then
+                TRIVY_CMD="$TRIVY_CMD --ignorefile ${{ inputs.trivyignore-path }}"
+              fi
+              
+              TRIVY_CMD="$TRIVY_CMD $TAG"
+              
+              # Vulnerability scan
+              if eval $TRIVY_CMD; then
+                echo "✅ Vulnerability scan passed for $PLATFORM"
+              else
+                echo "::error::❌ Vulnerability scan FAILED for $TARGET @ $PLATFORM"
+                SCAN_FAILED=1
+              fi
+              
+              # SBOM generation (always succeeds, for documentation)
+              trivy image \
+                --platform "$PLATFORM" \
+                --format spdx-json \
+                --output "$SBOM_FILE" \
+                "$TAG"
+              echo "✅ SBOM generated for $PLATFORM"
+              
+            done
+            
+            echo "::endgroup::"
+          done
+          
+          if [ $SCAN_FAILED -eq 1 ]; then
+            echo "::error::Security gate FAILED - vulnerabilities found"
+            exit 1
+          fi
+          
+          echo "::notice::✅ All security scans passed"
+      
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-results-${{ needs.prepare.outputs.instance_id }}
+          path: |
+            vuln-*.json
+            sbom-*.json
+          retention-days: 90
+
+  sign:
+    needs: [prepare, scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/artifacts
+          pattern: digests-${{ needs.prepare.outputs.instance_id }}-*
+          merge-multiple: false
+      
+      - name: Download scan results
+        uses: actions/download-artifact@v4
+        with:
+          name: scan-results-${{ needs.prepare.outputs.instance_id }}
+          path: ./scan-results
+      
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v4
+        with:
+          cosign-release: 'v3.0.4'
+      
+      - name: Fetch signing key from Infisical
+        uses: Infisical/secrets-action@v1.0.7
+        with:
+          method: universal-auth
+          client-id: ${{ secrets.infisical_client_id }}
+          client-secret: ${{ secrets.infisical_client_secret }}
+          project-id: ${{ secrets.infisical_project_id }}
+          env-slug: prod
+          project-slug: ${{ secrets.infisical_project_slug }}
+          secret-path: /
+      
+      - name: Verify signing key fetched
+        run: |
+          if [ -z "$COSIGN_PRIVATE_KEY" ]; then
+            echo "::error::Failed to fetch signing key from Infisical"
+            exit 1
+          fi
+          echo "::notice::✅ Signing key fetched successfully"
+      
+      - name: Sign images and create attestations
+        env:
+          COSIGN_PASSWORD: ""
+        run: |
+          TARGETS_INFO='${{ needs.prepare.outputs.targets_json }}'
+          TARGETS=$(echo "$TARGETS_INFO" | jq -r 'keys[]')
+          
+          # Write key to temp file
+          echo "$COSIGN_PRIVATE_KEY" > /tmp/cosign.key
+          
+          for TARGET in $TARGETS; do
+            echo "::group::Signing target: $TARGET"
+            
+            # Get first tag for this target
+            TAG=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].tags[0]')
+            PLATFORMS=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].platforms[]')
+            
+            for PLATFORM in $PLATFORMS; do
+              echo ""
+              echo "=== Processing $TAG @ $PLATFORM ==="
+              
+              PLATFORM_PAIR="${PLATFORM//\//-}"
+              
+              # Get digest for this platform
+              DIGEST_FILE="${{ runner.temp }}/artifacts/digests-${{ needs.prepare.outputs.instance_id }}-${TARGET}-${PLATFORM_PAIR}/digest.txt"
+              DIGEST=$(cat "$DIGEST_FILE" | tr -d '\n\r')
+              IMAGE_DIGEST="$TAG@sha256:$DIGEST"
+              
+              echo "Image digest: $IMAGE_DIGEST"
+              
+              # Extract provenance from buildx
+              echo "Extracting provenance..."
+              docker buildx imagetools inspect "$IMAGE_DIGEST" --format '{{ json .Provenance }}' > provenance-${TARGET}-${PLATFORM_PAIR}.json
+              
+              # Sign provenance attestation
+              echo "Signing provenance attestation..."
+              cosign attest --yes --key /tmp/cosign.key \
+                --predicate provenance-${TARGET}-${PLATFORM_PAIR}.json \
+                --type https://slsa.dev/provenance/v0.2 \
+                "$IMAGE_DIGEST"
+              
+              # Sign vulnerability attestation
+              echo "Signing vulnerability attestation..."
+              cosign attest --yes --key /tmp/cosign.key \
+                --predicate ./scan-results/vuln-${TARGET}-${PLATFORM_PAIR}.json \
+                --type vuln \
+                "$IMAGE_DIGEST"
+              
+              # Sign SBOM attestation
+              echo "Signing SBOM attestation..."
+              cosign attest --yes --key /tmp/cosign.key \
+                --predicate ./scan-results/sbom-${TARGET}-${PLATFORM_PAIR}.json \
+                --type spdxjson \
+                "$IMAGE_DIGEST"
+              
+              # Sign the image itself
+              echo "Signing image..."
+              cosign sign --yes --key /tmp/cosign.key "$IMAGE_DIGEST"
+              
+              echo "✅ Signed $PLATFORM"
+            done
+            
+            echo "::endgroup::"
+          done
+          
+          # Clean up key
+          rm -f /tmp/cosign.key
+          
+          echo "::notice::✅ All images and attestations signed successfully"
+      
+      - name: Verify signatures and log attestations
+        run: |
+          TARGETS_INFO='${{ needs.prepare.outputs.targets_json }}'
+          TARGETS=$(echo "$TARGETS_INFO" | jq -r 'keys[]')
+          
+          # Load public key from Infisical (it should be named COSIGN_PUBLIC_KEY)
+          # If not, we'll need to derive it or store it separately
+          echo "$COSIGN_PUBLIC_KEY" > /tmp/cosign.pub
+          
+          for TARGET in $TARGETS; do
+            echo "::group::Verifying target: $TARGET"
+            
+            TAG=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].tags[0]')
+            PLATFORMS=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].platforms[]')
+            
+            for PLATFORM in $PLATFORMS; do
+              PLATFORM_PAIR="${PLATFORM//\//-}"
+              DIGEST_FILE="${{ runner.temp }}/artifacts/digests-${{ needs.prepare.outputs.instance_id }}-${TARGET}-${PLATFORM_PAIR}/digest.txt"
+              DIGEST=$(cat "$DIGEST_FILE" | tr -d '\n\r')
+              IMAGE_DIGEST="$TAG@sha256:$DIGEST"
+              
+              echo ""
+              echo "=== Verifying $IMAGE_DIGEST ==="
+              
+              # Verify image signature
+              echo "Verifying image signature..."
+              cosign verify --key /tmp/cosign.pub "$IMAGE_DIGEST"
+              
+              # Verify and log provenance
+              echo "::group::Provenance Attestation Content"
+              cosign verify-attestation --key /tmp/cosign.pub --type slsaprovenance "$IMAGE_DIGEST" | \
+                jq -r '.payload' | base64 -d | jq '.predicate'
+              echo "::endgroup::"
+              
+              # Verify and log vulnerability attestation
+              echo "::group::Vulnerability Attestation Content"
+              cosign verify-attestation --key /tmp/cosign.pub --type vuln "$IMAGE_DIGEST" | \
+                jq -r '.payload' | base64 -d | jq '.predicate'
+              echo "::endgroup::"
+              
+              # Verify and log SBOM
+              echo "::group::SBOM Attestation Content"
+              cosign verify-attestation --key /tmp/cosign.pub --type spdxjson "$IMAGE_DIGEST" | \
+                jq -r '.payload' | base64 -d | jq '.predicate' | jq -c '{packages: .packages | length, name: .name}'
+              echo "::endgroup::"
+              
+              echo "✅ All signatures verified for $PLATFORM"
+            done
+            
+            echo "::endgroup::"
+          done
+          
+          rm -f /tmp/cosign.pub
