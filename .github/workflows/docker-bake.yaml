@@ -483,7 +483,7 @@ jobs:
           cosign-release: 'v3.0.4'
       
       - name: Fetch signing key from Infisical
-        uses: Infisical/secrets-action@v1.0.7
+        uses: Infisical/secrets-action@v1.0.15
         with:
           method: universal-auth
           client-id: ${{ secrets.INFISICAL_CLIENT_ID }}
