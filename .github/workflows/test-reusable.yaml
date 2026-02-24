@@ -1,0 +1,41 @@
+name: Test Reusable Workflow
+
+on:
+  workflow_call:
+    secrets:
+      caller_secret:
+        description: 'Secret from calling repo'
+        required: true
+
+jobs:
+  test-secrets:
+    runs-on: ubuntu-latest
+    environment: test-env
+    steps:
+      - name: Show caller secret
+        run: |
+          echo "::notice::Caller secret (first 5 chars): ${CALLER_SECRET:0:5}..."
+        env:
+          CALLER_SECRET: ${{ secrets.caller_secret }}
+      
+      - name: Show environment secret
+        run: |
+          echo "::notice::Environment secret (first 5 chars): ${ENV_SECRET:0:5}..."
+        env:
+          ENV_SECRET: ${{ secrets.TEST_SECRET }}
+      
+      - name: Verify both secrets exist
+        run: |
+          if [ -z "$CALLER_SECRET" ]; then
+            echo "::error::Caller secret is empty!"
+            exit 1
+          fi
+          
+          if [ -z "$ENV_SECRET" ]; then
+            echo "::error::Environment secret is empty!"
+            exit 1
+          fi
+          
+          echo "::notice::✅ Both secrets are available!"
+          echo "::notice::Caller secret came from calling repo"
+          echo "::notice::Environment secret came from workflow repo environment"
