@@ -46,31 +46,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare build-time secrets
-        env:
-          BUILD_SECRETS_JSON: ${{ secrets.build_secrets }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "$BUILD_SECRETS_JSON" ]; then
-            exit 0
-          fi
-
-          SECRETS_DIR="${RUNNER_TEMP}/build-secrets"
-          mkdir -p -m 700 "$SECRETS_DIR"
-
-          jq -e '
-            type == "object" and
-            all(to_entries[]; (.key | test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and (.value | type == "string"))
-          ' <<< "$BUILD_SECRETS_JSON" >/dev/null
-
-          while IFS= read -r SECRET_ID; do
-            jq -j --arg id "$SECRET_ID" '.[$id]' <<< "$BUILD_SECRETS_JSON" > "$SECRETS_DIR/$SECRET_ID"
-            chmod 600 "$SECRETS_DIR/$SECRET_ID"
-          done < <(jq -r 'keys[]' <<< "$BUILD_SECRETS_JSON")
-
-          echo "BUILD_SECRETS_DIR=$SECRETS_DIR" >> "$GITHUB_ENV"
-
       - name: Parse bake file and build matrix and target info
         id: parse
         env:
@@ -80,7 +55,7 @@ jobs:
           INSTANCE_ID=$(head -c 4 /dev/urandom | xxd -p)
           echo "instance_id=$INSTANCE_ID" >> $GITHUB_OUTPUT
 
-          BAKE_JSON=$(docker buildx bake --allow=fs.read="${RUNNER_TEMP}/build-secrets" --file ${{ inputs.bake-file }} --print ${{ inputs.group }})
+          BAKE_JSON=$(docker buildx bake --file ${{ inputs.bake-file }} --print ${{ inputs.group }})
           TARGET_NAMES=$(echo "$BAKE_JSON" | jq -r --arg group '${{ inputs.group }}' '.group[$group].targets[]')
 
           MATRIX_ITEMS='[]'
@@ -121,13 +96,6 @@ jobs:
           echo "=== Targets Info ==="
           echo "$TARGETS_INFO" | jq .
 
-      - name: Remove build-time secrets
-        if: ${{ always() }}
-        run: |
-          if [ -n "${BUILD_SECRETS_DIR:-}" ]; then
-            rm -rf -- "$BUILD_SECRETS_DIR"
-          fi
-
   build:
     needs: prepare
     strategy:
@@ -159,28 +127,27 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Optional bundle: non-secret targets continue without creating a
-          # directory or requiring a Bake secret source.
+          # Optional bundle: non-secret targets continue without exporting
+          # any build-secret environment variables.
           if [ -z "$BUILD_SECRETS_JSON" ]; then
             exit 0
           fi
 
-          SECRETS_DIR="${RUNNER_TEMP}/build-secrets"
-          mkdir -p -m 700 "$SECRETS_DIR"
-
-          # Secret IDs become filenames, so allow only a conservative filename
-          # character set and require every value to be a string.
+          # Bundle keys become BUILD_SECRET_<KEY> environment variables.
           jq -e '
             type == "object" and
-            all(to_entries[]; (.key | test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and (.value | type == "string"))
+            all(to_entries[]; (.key | test("^[A-Za-z_][A-Za-z0-9_]*$")) and (.value | type == "string"))
           ' <<< "$BUILD_SECRETS_JSON" >/dev/null
 
           while IFS= read -r SECRET_ID; do
-            jq -j --arg id "$SECRET_ID" '.[$id]' <<< "$BUILD_SECRETS_JSON" > "$SECRETS_DIR/$SECRET_ID"
-            chmod 600 "$SECRETS_DIR/$SECRET_ID"
+            ENV_NAME="BUILD_SECRET_${SECRET_ID^^}"
+            DELIMITER=$(uuidgen)
+            {
+              printf '%s<<%s\n' "$ENV_NAME" "$DELIMITER"
+              jq -j --arg id "$SECRET_ID" '.[$id]' <<< "$BUILD_SECRETS_JSON"
+              printf '\n%s\n' "$DELIMITER"
+            } >> "$GITHUB_ENV"
           done < <(jq -r 'keys[]' <<< "$BUILD_SECRETS_JSON")
-
-          echo "BUILD_SECRETS_DIR=$SECRETS_DIR" >> "$GITHUB_ENV"
 
       - name: Build
         id: bake
@@ -190,17 +157,9 @@ jobs:
         with:
           files: ${{ inputs.bake-file }}
           targets: ${{ matrix.target }}
-          allow: fs.read=${{ runner.temp }}/build-secrets
           set: |
             *.platform=${{ matrix.platform }}
             *.output=type=image,push=true
-
-      - name: Remove build-time secrets
-        if: ${{ always() }}
-        run: |
-          if [ -n "${BUILD_SECRETS_DIR:-}" ]; then
-            rm -rf -- "$BUILD_SECRETS_DIR"
-          fi
 
       - name: Export digest
         run: |
