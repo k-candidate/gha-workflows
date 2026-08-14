@@ -30,6 +30,9 @@ on:
       dockerhub_token:
         description: 'DockerHub token'
         required: true
+      build_secrets:
+        description: 'Optional JSON object mapping BuildKit secret IDs to their values'
+        required: false
 
 jobs:
   prepare:
@@ -118,6 +121,30 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Prepare build-time secrets
+        if: ${{ secrets.build_secrets != '' }}
+        env:
+          BUILD_SECRETS_JSON: ${{ secrets.build_secrets }}
+        run: |
+          set -euo pipefail
+
+          SECRETS_DIR="${RUNNER_TEMP}/build-secrets"
+          mkdir -p -m 700 "$SECRETS_DIR"
+
+          # Secret IDs become filenames, so allow only a conservative filename
+          # character set and require every value to be a string.
+          jq -e '
+            type == "object" and
+            all(to_entries[]; (.key | test("^[A-Za-z0-9][A-Za-z0-9_.-]*$")) and (.value | type == "string"))
+          ' <<< "$BUILD_SECRETS_JSON" >/dev/null
+
+          while IFS= read -r SECRET_ID; do
+            jq -j --arg id "$SECRET_ID" '.[$id]' <<< "$BUILD_SECRETS_JSON" > "$SECRETS_DIR/$SECRET_ID"
+            chmod 600 "$SECRETS_DIR/$SECRET_ID"
+          done < <(jq -r 'keys[]' <<< "$BUILD_SECRETS_JSON")
+
+          echo "BUILD_SECRETS_DIR=$SECRETS_DIR" >> "$GITHUB_ENV"
+
       - name: Build
         id: bake
         env:
@@ -126,9 +153,17 @@ jobs:
         with:
           files: ${{ inputs.bake-file }}
           targets: ${{ matrix.target }}
+          allow: fs.read=${{ runner.temp }}/build-secrets
           set: |
             *.platform=${{ matrix.platform }}
             *.output=type=image,push=true
+
+      - name: Remove build-time secrets
+        if: ${{ always() }}
+        run: |
+          if [ -n "${BUILD_SECRETS_DIR:-}" ]; then
+            rm -rf -- "$BUILD_SECRETS_DIR"
+          fi
 
       - name: Export digest
         run: |
