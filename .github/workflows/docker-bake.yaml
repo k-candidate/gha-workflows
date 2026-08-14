@@ -122,11 +122,16 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Prepare build-time secrets
-        if: ${{ secrets.build_secrets != '' }}
         env:
           BUILD_SECRETS_JSON: ${{ secrets.build_secrets }}
         run: |
           set -euo pipefail
+
+          # Optional bundle: non-secret targets continue without creating a
+          # directory or requiring a Bake secret source.
+          if [ -z "$BUILD_SECRETS_JSON" ]; then
+            exit 0
+          fi
 
           SECRETS_DIR="${RUNNER_TEMP}/build-secrets"
           mkdir -p -m 700 "$SECRETS_DIR"
