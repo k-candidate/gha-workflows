@@ -23,11 +23,6 @@ on:
         description: 'Runner to use for arm64 builds'
         type: string
         default: 'ubuntu-24.04-arm'
-      secret-names:
-        description: 'Optional newline-separated list of inherited GitHub secret names to export as environment variables for Docker Bake'
-        type: string
-        required: false
-        default: ''
     secrets:
       dockerhub_username:
         description: 'DockerHub username'
@@ -123,28 +118,50 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Export inherited build secrets
+      - name: Discover and export inherited build secrets
         env:
           ALL_INHERITED_SECRETS: ${{ toJSON(secrets) }}
-          SECRET_NAMES: ${{ inputs.secret-names }}
+          BAKE_FILE: ${{ inputs.bake-file }}
+          BAKE_GROUP: ${{ inputs.group }}
         run: |
           set -euo pipefail
 
+          BAKE_JSON=$(docker buildx bake --file "$BAKE_FILE" --print "$BAKE_GROUP")
+
+          BAD_SECRET_NAMES=$(echo "$BAKE_JSON" | jq -r '
+            .target
+            | to_entries[]
+            | .value.secret[]?
+            | select(type == "object")
+            | select((.id // empty) != "" and (.env // empty) != "" and (.id != .env))
+            | "id=\(.id) env=\(.env)"' || true)
+
+          if [ -n "$BAD_SECRET_NAMES" ]; then
+            echo "ERROR: Every bake secret id must match its env name. Found mismatches:"
+            printf '%s\n' "$BAD_SECRET_NAMES"
+            exit 1
+          fi
+
+          SECRET_NAMES=$(echo "$BAKE_JSON" | jq -r '
+            .target
+            | to_entries[]
+            | .value.secret[]?
+            | if type == "object" then (.id // .env // empty) else . end
+            | select(length > 0)
+          ' | sort -u)
+
           if [ -z "$SECRET_NAMES" ]; then
-            echo "No build secret names supplied; skipping secret export."
+            echo "No build secrets referenced by the bake file for group $BAKE_GROUP."
             exit 0
           fi
 
           while IFS= read -r SECRET_NAME; do
-            SECRET_NAME="${SECRET_NAME%$'\r'}"
-            SECRET_NAME="${SECRET_NAME#"${SECRET_NAME%%[![:space:]]*}"}"
-            SECRET_NAME="${SECRET_NAME%"${SECRET_NAME##*[![:space:]]}"}"
             [ -n "$SECRET_NAME" ] || continue
 
             SECRET_VALUE=$(echo "$ALL_INHERITED_SECRETS" | jq -r --arg key "$SECRET_NAME" '.[$key] // empty')
             if [ -z "$SECRET_VALUE" ]; then
-              echo "Warning: secret not found in inherited secrets: $SECRET_NAME"
-              continue
+              echo "ERROR: Required inherited secret not found: $SECRET_NAME"
+              exit 1
             fi
 
             DELIMITER=$(uuidgen)
@@ -153,7 +170,7 @@ jobs:
               printf '%s\n' "$SECRET_VALUE"
               printf '%s\n' "$DELIMITER"
             } >> "$GITHUB_ENV"
-          done < <(printf '%s\n' "$SECRET_NAMES" | tr ',' '\n' | sed '/^$/d')
+          done <<< "$SECRET_NAMES"
 
       - name: Build
         id: bake
