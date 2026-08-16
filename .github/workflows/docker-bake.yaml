@@ -23,6 +23,11 @@ on:
         description: 'Runner to use for arm64 builds'
         type: string
         default: 'ubuntu-24.04-arm'
+      secret-names:
+        description: 'Optional newline-separated list of inherited GitHub secret names to export as environment variables for Docker Bake'
+        type: string
+        required: false
+        default: ''
     secrets:
       dockerhub_username:
         description: 'DockerHub username'
@@ -118,12 +123,42 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Export inherited build secrets
+        env:
+          ALL_INHERITED_SECRETS: ${{ toJSON(secrets) }}
+          SECRET_NAMES: ${{ inputs.secret-names }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$SECRET_NAMES" ]; then
+            echo "No build secret names supplied; skipping secret export."
+            exit 0
+          fi
+
+          while IFS= read -r SECRET_NAME; do
+            SECRET_NAME="${SECRET_NAME%$'\r'}"
+            SECRET_NAME="${SECRET_NAME#"${SECRET_NAME%%[![:space:]]*}"}"
+            SECRET_NAME="${SECRET_NAME%"${SECRET_NAME##*[![:space:]]}"}"
+            [ -n "$SECRET_NAME" ] || continue
+
+            SECRET_VALUE=$(echo "$ALL_INHERITED_SECRETS" | jq -r --arg key "$SECRET_NAME" '.[$key] // empty')
+            if [ -z "$SECRET_VALUE" ]; then
+              echo "Warning: secret not found in inherited secrets: $SECRET_NAME"
+              continue
+            fi
+
+            DELIMITER=$(uuidgen)
+            {
+              printf '%s<<%s\n' "$SECRET_NAME" "$DELIMITER"
+              printf '%s\n' "$SECRET_VALUE"
+              printf '%s\n' "$DELIMITER"
+            } >> "$GITHUB_ENV"
+          done < <(printf '%s\n' "$SECRET_NAMES" | tr ',' '\n' | sed '/^$/d')
+
       - name: Build
         id: bake
         env:
           VERSION: ${{ inputs.version }}
-          BUILD_SECRET_TEST_BUILD_SECRET_1: ${{ secrets.BUILD_SECRET_TEST_BUILD_SECRET_1 }}
-          BUILD_SECRET_TEST_BUILD_SECRET_2: ${{ secrets.BUILD_SECRET_TEST_BUILD_SECRET_2 }}
         uses: docker/bake-action@v6
         with:
           files: ${{ inputs.bake-file }}
