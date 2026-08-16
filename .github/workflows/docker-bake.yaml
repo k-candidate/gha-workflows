@@ -30,9 +30,6 @@ on:
       dockerhub_token:
         description: 'DockerHub token'
         required: true
-      build_secrets:
-        description: 'Optional JSON object mapping BuildKit secret IDs to their values'
-        required: false
 
 jobs:
   prepare:
@@ -121,38 +118,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Prepare build-time secrets
-        env:
-          BUILD_SECRETS_JSON: ${{ secrets.build_secrets }}
-        run: |
-          set -euo pipefail
-
-          # Optional bundle: non-secret targets continue without exporting
-          # any build-secret environment variables.
-          if [ -z "$BUILD_SECRETS_JSON" ]; then
-            exit 0
-          fi
-
-          # Bundle keys become BUILD_SECRET_<KEY> environment variables.
-          jq -e '
-            type == "object" and
-            all(to_entries[]; (.key | test("^[A-Za-z_][A-Za-z0-9_]*$")) and (.value | type == "string"))
-          ' <<< "$BUILD_SECRETS_JSON" >/dev/null
-
-          while IFS= read -r SECRET_ID; do
-            ENV_NAME="BUILD_SECRET_${SECRET_ID^^}"
-            DELIMITER=$(uuidgen)
-            {
-              printf '%s<<%s\n' "$ENV_NAME" "$DELIMITER"
-              jq -j --arg id "$SECRET_ID" '.[$id]' <<< "$BUILD_SECRETS_JSON"
-              printf '\n%s\n' "$DELIMITER"
-            } >> "$GITHUB_ENV"
-          done < <(jq -r 'keys[]' <<< "$BUILD_SECRETS_JSON")
-
       - name: Build
         id: bake
         env:
           VERSION: ${{ inputs.version }}
+          BUILD_SECRET_TEST_BUILD_SECRET_1: ${{ secrets.BUILD_SECRET_TEST_BUILD_SECRET_1 }}
+          BUILD_SECRET_TEST_BUILD_SECRET_2: ${{ secrets.BUILD_SECRET_TEST_BUILD_SECRET_2 }}
         uses: docker/bake-action@v6
         with:
           files: ${{ inputs.bake-file }}
