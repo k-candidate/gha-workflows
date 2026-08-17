@@ -272,21 +272,18 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Prepare OCI annotations for merge
+      - name: Prepare OCI annotations for merge (future use)
+        if: ${{ needs.prepare.outputs.needs_merge == 'true' }}
         env:
           ANNOTATIONS_JSON: ${{ needs.prepare.outputs.annotations_json }}
         run: |
-          # Convert annotations JSON to imagetools --annotation flags
-          ANNOTATION_FLAGS=""
-          while IFS='=' read -r key value; do
-            value="${value%\"}"
-            value="${value#\"}"
-            ANNOTATION_FLAGS="${ANNOTATION_FLAGS}--annotation ${key}=${value} "
-          done < <(echo "$ANNOTATIONS_JSON" | jq -r 'to_entries | .[] | "\(.key)=\(.value)"')
+          # Note: docker buildx imagetools create does not yet support --annotation flags
+          # for adding annotations to OCI Index and Descriptors.
+          # This step is reserved for future use when docker buildx adds this capability.
+          # For now, annotations are applied at the image manifest level during build.
           
-          echo "ANNOTATION_FLAGS=${ANNOTATION_FLAGS}" >> $GITHUB_ENV
-          echo "=== Annotation flags for manifest merge ==="
-          echo "$ANNOTATION_FLAGS"
+          echo "=== OCI Annotations (ready for future imagetools support) ==="
+          echo "$ANNOTATIONS_JSON" | jq .
 
       - name: Create manifest lists and push
         run: |
@@ -359,9 +356,11 @@ jobs:
                 if [ ${#TAG_SOURCES[@]} -gt 0 ]; then
                   echo "  Sources:"
                   printf '    %s\n' "${TAG_SOURCES[@]}"
+                  # Create manifest list (imagetools doesn't support --annotation flag yet)
+                  # Annotations at index/descriptor levels would be added here once supported
                   # shellcheck disable=SC2086
-                  docker buildx imagetools create -t "$TAG" $ANNOTATION_FLAGS "${TAG_SOURCES[@]}"
-                  echo "  ✓ Manifest created with OCI annotations"
+                  docker buildx imagetools create -t "$TAG" "${TAG_SOURCES[@]}"
+                  echo "  ✓ Manifest created"
                 else
                   echo "  ✗ No sources found"
                 fi
