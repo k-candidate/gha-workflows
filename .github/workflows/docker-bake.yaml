@@ -39,9 +39,32 @@ jobs:
       targets_json: ${{ steps.parse.outputs.targets_json }}
       needs_merge: ${{ steps.parse.outputs.needs_merge }}
       instance_id: ${{ steps.parse.outputs.instance_id }}
+      annotations_json: ${{ steps.annotations.outputs.annotations_json }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Compute OCI annotations
+        id: annotations
+        env:
+          GH_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          GH_SHA: ${{ github.sha }}
+          GH_REF_NAME: ${{ github.ref_name }}
+        run: |
+          # Compute the 4 standard OCI annotations from GitHub context
+          CREATED_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          
+          ANNOTATIONS='{
+            "org.opencontainers.image.created": "'$CREATED_TIME'",
+            "org.opencontainers.image.source": "'$GH_REPO_URL'",
+            "org.opencontainers.image.version": "'$GH_REF_NAME'",
+            "org.opencontainers.image.revision": "'$GH_SHA'"
+          }'
+          
+          echo "annotations_json=$(echo "$ANNOTATIONS" | jq -c .)" >> $GITHUB_OUTPUT
+          
+          echo "=== OCI Annotations (workflow-managed) ==="
+          echo "$ANNOTATIONS" | jq .
 
       - name: Parse bake file and build matrix and target info
         id: parse
@@ -172,6 +195,22 @@ jobs:
             } >> "$GITHUB_ENV"
           done <<< "$SECRET_NAMES"
 
+      - name: Prepare OCI annotations for build
+        env:
+          ANNOTATIONS_JSON: ${{ needs.prepare.outputs.annotations_json }}
+        run: |
+          # Convert annotations JSON to Buildx --set format
+          ANNOTATION_ARGS=""
+          while IFS='=' read -r key value; do
+            value="${value%\"}"
+            value="${value#\"}"
+            ANNOTATION_ARGS="${ANNOTATION_ARGS}*.annotations=${key}=${value}"$'\n'
+          done < <(echo "$ANNOTATIONS_JSON" | jq -r 'to_entries | .[] | "\(.key)=\(.value)"')
+          
+          echo "ANNOTATION_ARGS<<EOF" >> $GITHUB_ENV
+          echo "$ANNOTATION_ARGS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
       - name: Build
         id: bake
         env:
@@ -183,6 +222,7 @@ jobs:
           set: |
             *.platform=${{ matrix.platform }}
             *.output=type=image,push=true
+            ${{ env.ANNOTATION_ARGS }}
 
       - name: Export digest
         run: |
@@ -231,6 +271,22 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      - name: Prepare OCI annotations for merge
+        env:
+          ANNOTATIONS_JSON: ${{ needs.prepare.outputs.annotations_json }}
+        run: |
+          # Convert annotations JSON to imagetools --annotation flags
+          ANNOTATION_FLAGS=""
+          while IFS='=' read -r key value; do
+            value="${value%\"}"
+            value="${value#\"}"
+            ANNOTATION_FLAGS="${ANNOTATION_FLAGS}--annotation ${key}=${value} "
+          done < <(echo "$ANNOTATIONS_JSON" | jq -r 'to_entries | .[] | "\(.key)=\(.value)"')
+          
+          echo "ANNOTATION_FLAGS=${ANNOTATION_FLAGS}" >> $GITHUB_ENV
+          echo "=== Annotation flags for manifest merge ==="
+          echo "$ANNOTATION_FLAGS"
 
       - name: Create manifest lists and push
         run: |
@@ -303,8 +359,9 @@ jobs:
                 if [ ${#TAG_SOURCES[@]} -gt 0 ]; then
                   echo "  Sources:"
                   printf '    %s\n' "${TAG_SOURCES[@]}"
-                  docker buildx imagetools create -t "$TAG" "${TAG_SOURCES[@]}"
-                  echo "  ✓ Manifest created"
+                  # shellcheck disable=SC2086
+                  docker buildx imagetools create -t "$TAG" $ANNOTATION_FLAGS "${TAG_SOURCES[@]}"
+                  echo "  ✓ Manifest created with OCI annotations"
                 else
                   echo "  ✗ No sources found"
                 fi
