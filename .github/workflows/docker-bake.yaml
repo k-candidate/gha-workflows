@@ -433,10 +433,12 @@ jobs:
               if [ "$PLATFORM_COUNT" -gt 1 ]; then
                 INDEX=$(regctl manifest get "$TAG" --format raw-body)
                 verify_annotations "OCI index" "$INDEX"
+                while IFS= read -r DESCRIPTOR; do
+                  DESCRIPTOR_PLATFORM=$(echo "$DESCRIPTOR" | jq -r '
+                    if .platform then (.platform.os + "/" + .platform.architecture) else "unspecified" end')
+                  verify_annotations "descriptor for $DESCRIPTOR_PLATFORM" "$DESCRIPTOR"
+                done < <(echo "$INDEX" | jq -c '.manifests[]')
                 for PLATFORM in $PLATFORMS; do
-                  DESCRIPTOR=$(echo "$INDEX" | jq -c --arg platform "$PLATFORM" '
-                    .manifests[] | select(.platform.os + "/" + .platform.architecture == $platform)')
-                  verify_annotations "descriptor for $PLATFORM" "$DESCRIPTOR"
                   IMAGE_MANIFEST=$(regctl manifest get "$TAG" --platform="$PLATFORM" --format raw-body)
                   verify_annotations "image manifest for $PLATFORM" "$IMAGE_MANIFEST"
                 done
