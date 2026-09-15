@@ -326,7 +326,7 @@ jobs:
             echo "$TAGS"
             echo "Platforms: $PLATFORM_COUNT"
             
-            # Build the index from the platform manifests that the build jobs pushed.
+            # Report the platform manifests that the build jobs pushed.
             for PLATFORM in $PLATFORMS; do
               PLATFORM_PAIR="${PLATFORM//\//-}"
               DIGEST_FILE="${{ runner.temp }}/artifacts/digests-${{ needs.prepare.outputs.instance_id }}-${TARGET}-${PLATFORM_PAIR}/digest.txt"
@@ -343,26 +343,21 @@ jobs:
               fi
             done
             
-            # Create an OCI Index for every multi-platform tag. regctl writes
-            # index and descriptor annotations atomically and defaults to the
-            # OCI media type required for index annotations.
+            # Buildx derives the platform metadata for each descriptor. regctl
+            # then adds annotations to the OCI Index and every descriptor.
             if [ $PLATFORM_COUNT -gt 1 ]; then
               for TAG in $TAGS; do
                 echo ""
                 echo "Creating OCI index for: $TAG"
                 ANNOTATIONS=$(echo "$TARGETS_INFO" | jq -c --arg target "$TARGET" '.[$target].annotations')
-                CREATE_ARGS=(regctl index create "$TAG")
-                while IFS='=' read -r key value; do
-                  CREATE_ARGS+=(--annotation "$key=$value" --desc-annotation "$key=$value")
-                done < <(echo "$ANNOTATIONS" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
-
+                TAG_SOURCES=()
                 FOUND_DIGESTS=0
                 for PLATFORM in $PLATFORMS; do
                   PLATFORM_PAIR="${PLATFORM//\//-}"
                   DIGEST_FILE="${{ runner.temp }}/artifacts/digests-${{ needs.prepare.outputs.instance_id }}-${TARGET}-${PLATFORM_PAIR}/digest.txt"
                   if [ -f "$DIGEST_FILE" ]; then
-                    DIGEST=$(tr -d '\n\r' < "$DIGEST_FILE")
-                    CREATE_ARGS+=(--ref "$TAG@sha256:$DIGEST")
+                    DIGEST=$(cat "$DIGEST_FILE" | tr -d '\n\r')
+                    TAG_SOURCES+=("$TAG@sha256:$DIGEST")
                     FOUND_DIGESTS=$((FOUND_DIGESTS + 1))
                   fi
                 done
@@ -370,7 +365,12 @@ jobs:
                   echo "ERROR: Expected $PLATFORM_COUNT platform digests for $TARGET, found $FOUND_DIGESTS"
                   exit 1
                 fi
-                "${CREATE_ARGS[@]}"
+                docker buildx imagetools create --prefer-index=true -t "$TAG" "${TAG_SOURCES[@]}"
+
+                INDEX=$(regctl manifest get "$TAG" --format raw-body)
+                echo "$INDEX" | jq --argjson annotations "$ANNOTATIONS" \
+                  '.annotations = $annotations | .manifests |= map(.annotations = $annotations)' \
+                  | regctl manifest put "$TAG"
               done
             else
               # Single platform: image already pushed during build, manifest not needed.
@@ -441,7 +441,8 @@ jobs:
                   verify_annotations "image manifest for $PLATFORM" "$IMAGE_MANIFEST"
                 done
               else
-                IMAGE_MANIFEST=$(regctl manifest get "$TAG" --format raw-body)
+                PLATFORM=$(echo "$PLATFORMS" | head -n 1)
+                IMAGE_MANIFEST=$(regctl manifest get "$TAG" --platform="$PLATFORM" --format raw-body)
                 verify_annotations "single-architecture image manifest" "$IMAGE_MANIFEST"
               fi
             done
