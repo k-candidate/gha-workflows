@@ -39,14 +39,40 @@ jobs:
       targets_json: ${{ steps.parse.outputs.targets_json }}
       needs_merge: ${{ steps.parse.outputs.needs_merge }}
       instance_id: ${{ steps.parse.outputs.instance_id }}
+      managed_annotations_json: ${{ steps.annotations.outputs.annotations_json }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Compute OCI annotations
+        id: annotations
+        env:
+          GH_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          GH_SHA: ${{ github.sha }}
+          IMAGE_VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          # Compute the 4 standard OCI annotations from GitHub context
+          CREATED_TIME=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          ANNOTATIONS=$(jq -cn \
+            --arg created "$CREATED_TIME" \
+            --arg source "$GH_REPO_URL" \
+            --arg version "$IMAGE_VERSION" \
+            --arg revision "$GH_SHA" \
+            '{"org.opencontainers.image.created": $created,
+              "org.opencontainers.image.source": $source,
+              "org.opencontainers.image.version": $version,
+              "org.opencontainers.image.revision": $revision}')
+          
+          echo "annotations_json=$(echo "$ANNOTATIONS" | jq -c .)" >> $GITHUB_OUTPUT
+          
+          echo "=== OCI Annotations (workflow-managed) ==="
+          echo "$ANNOTATIONS" | jq .
 
       - name: Parse bake file and build matrix and target info
         id: parse
         env:
           VERSION: ${{ inputs.version }}
+          MANAGED_ANNOTATIONS: ${{ steps.annotations.outputs.annotations_json }}
         run: |
           # Unique ID to namespace artifacts when multiple caller jobs invoke this workflow in one run
           INSTANCE_ID=$(head -c 4 /dev/urandom | xxd -p)
@@ -77,8 +103,21 @@ jobs:
               '[.target[$target].tags[]? | select(test("^[a-zA-Z0-9-._/]+@[a-f0-9]{64}$") | not)]')
             PLATFORMS_JSON=$(echo "$BAKE_JSON" | jq -c --arg target "$TARGET" \
               '[.target[$target].platforms[]?]')
-            TARGETS_INFO=$(echo "$TARGETS_INFO" | jq -c --arg target "$TARGET" --argjson tags "$TAGS" --argjson platforms "$PLATFORMS_JSON" \
-              '.[$target] = {"tags": $tags, "platforms": $platforms}')
+            # Bake uses key=value strings for annotations. Preserve every caller
+            # annotation, then overwrite only the workflow-managed OCI keys.
+            CALLER_ANNOTATIONS=$(echo "$BAKE_JSON" | jq -c --arg target "$TARGET" '
+              [.target[$target].annotations[]? | capture("^(?<key>[^=]+)=(?<value>.*)$")]
+              | reduce .[] as $annotation ({}; .[$annotation.key] = $annotation.value)')
+            EFFECTIVE_ANNOTATIONS=$(jq -cn \
+              --argjson caller "$CALLER_ANNOTATIONS" \
+              --argjson managed "$MANAGED_ANNOTATIONS" \
+              '$caller + $managed')
+            TARGETS_INFO=$(echo "$TARGETS_INFO" | jq -c \
+              --arg target "$TARGET" \
+              --argjson tags "$TAGS" \
+              --argjson platforms "$PLATFORMS_JSON" \
+              --argjson annotations "$EFFECTIVE_ANNOTATIONS" \
+              '.[$target] = {"tags": $tags, "platforms": $platforms, "annotations": $annotations}')
           done
 
           echo "matrix=$MATRIX_ITEMS" >> $GITHUB_OUTPUT
@@ -172,6 +211,22 @@ jobs:
             } >> "$GITHUB_ENV"
           done <<< "$SECRET_NAMES"
 
+      - name: Add workflow-managed OCI annotations to the build
+        env:
+          MANAGED_ANNOTATIONS: ${{ needs.prepare.outputs.managed_annotations_json }}
+        run: |
+          # These are appended after the Bake-file annotations, so BuildKit uses
+          # these values for the four centrally managed keys. Other annotations
+          # remain owned by the calling repository.
+          ANNOTATION_ARGS=""
+          while IFS='=' read -r key value; do
+            ANNOTATION_ARGS="${ANNOTATION_ARGS}${{ matrix.target }}.annotations=${key}=${value}"$'\n'
+          done < <(echo "$MANAGED_ANNOTATIONS" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
+          
+          echo "ANNOTATION_ARGS<<EOF" >> $GITHUB_ENV
+          echo "$ANNOTATION_ARGS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
       - name: Build
         id: bake
         env:
@@ -183,6 +238,7 @@ jobs:
           set: |
             *.platform=${{ matrix.platform }}
             *.output=type=image,push=true
+            ${{ env.ANNOTATION_ARGS }}
 
       - name: Export digest
         run: |
@@ -232,7 +288,16 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Create manifest lists and push
+      - name: Install regctl
+        run: |
+          # Install regctl for manifest manipulation
+          mkdir -p /tmp/regctl-install
+          cd /tmp/regctl-install
+          curl -L https://github.com/regclient/regclient/releases/latest/download/regctl-linux-amd64 -o regctl
+          chmod +x regctl
+          sudo mv regctl /usr/local/bin/
+
+      - name: Create OCI indexes with annotations
         run: |
           # Parse the targets info JSON
           TARGETS_INFO='${{ needs.prepare.outputs.targets_json }}'
@@ -261,8 +326,7 @@ jobs:
             echo "$TAGS"
             echo "Platforms: $PLATFORM_COUNT"
             
-            # Build list of digest sources for this target
-            SOURCES=()
+            # Report the platform manifests that the build jobs pushed.
             for PLATFORM in $PLATFORMS; do
               PLATFORM_PAIR="${PLATFORM//\//-}"
               DIGEST_FILE="${{ runner.temp }}/artifacts/digests-${{ needs.prepare.outputs.instance_id }}-${TARGET}-${PLATFORM_PAIR}/digest.txt"
@@ -270,10 +334,6 @@ jobs:
               if [ -f "$DIGEST_FILE" ]; then
                 DIGEST=$(cat "$DIGEST_FILE" | tr -d '\n\r')
                 if [ ${#DIGEST} -eq 64 ]; then
-                  # Add source for each tag
-                  for TAG in $TAGS; do
-                    SOURCES+=("$TAG@sha256:$DIGEST")
-                  done
                   echo "  Found digest for $PLATFORM: $DIGEST"
                 else
                   echo "  Warning: Invalid digest in $DIGEST_FILE"
@@ -283,31 +343,43 @@ jobs:
               fi
             done
             
-            echo "Total sources collected: ${#SOURCES[@]}"
-            
-            # Create manifest for each tag in this target
+            # Buildx derives the platform metadata for each descriptor. regctl
+            # then adds annotations to the OCI Index and every descriptor.
             if [ $PLATFORM_COUNT -gt 1 ]; then
-              # Multi-platform: create manifest list
               for TAG in $TAGS; do
                 echo ""
-                echo "Creating multi-platform manifest for: $TAG"
-                
-                # Filter sources for this specific tag
+                echo "Creating OCI index for: $TAG"
+                ANNOTATIONS=$(echo "$TARGETS_INFO" | jq -c --arg target "$TARGET" '.[$target].annotations')
                 TAG_SOURCES=()
-                for src in "${SOURCES[@]}"; do
-                  if [[ "$src" == "$TAG@sha256:"* ]]; then
-                    TAG_SOURCES+=("$src")
+                FOUND_DIGESTS=0
+                for PLATFORM in $PLATFORMS; do
+                  PLATFORM_PAIR="${PLATFORM//\//-}"
+                  DIGEST_FILE="${{ runner.temp }}/artifacts/digests-${{ needs.prepare.outputs.instance_id }}-${TARGET}-${PLATFORM_PAIR}/digest.txt"
+                  if [ -f "$DIGEST_FILE" ]; then
+                    DIGEST=$(cat "$DIGEST_FILE" | tr -d '\n\r')
+                    TAG_SOURCES+=("$TAG@sha256:$DIGEST")
+                    FOUND_DIGESTS=$((FOUND_DIGESTS + 1))
                   fi
                 done
-                
-                if [ ${#TAG_SOURCES[@]} -gt 0 ]; then
-                  echo "  Sources:"
-                  printf '    %s\n' "${TAG_SOURCES[@]}"
-                  docker buildx imagetools create -t "$TAG" "${TAG_SOURCES[@]}"
-                  echo "  ✓ Manifest created"
-                else
-                  echo "  ✗ No sources found"
+                if [ "$FOUND_DIGESTS" -ne "$PLATFORM_COUNT" ]; then
+                  echo "ERROR: Expected $PLATFORM_COUNT platform digests for $TARGET, found $FOUND_DIGESTS"
+                  exit 1
                 fi
+                docker buildx imagetools create --prefer-index=true -t "$TAG" "${TAG_SOURCES[@]}"
+
+                INDEX=$(regctl manifest get "$TAG" --format raw-body)
+                for ATTEMPT in 1 2 3; do
+                  if echo "$INDEX" | jq --argjson annotations "$ANNOTATIONS" \
+                    '.annotations = $annotations | .manifests |= map(.annotations = $annotations)' \
+                    | regctl manifest put "$TAG"; then
+                    break
+                  fi
+                  if [ "$ATTEMPT" -eq 3 ]; then
+                    echo "ERROR: Failed to write OCI annotations for $TAG after $ATTEMPT attempts"
+                    exit 1
+                  fi
+                  sleep $((ATTEMPT * 2))
+                done
               done
             else
               # Single platform: image already pushed during build, manifest not needed.
@@ -319,7 +391,28 @@ jobs:
             fi
           done
 
-      - name: Inspect images
+  verify:
+    if: ${{ always() && needs.prepare.result == 'success' && needs.build.result == 'success' && (needs.merge.result == 'success' || needs.merge.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - build
+      - merge
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Install regctl
+        run: |
+          mkdir -p /tmp/regctl-install
+          curl -L https://github.com/regclient/regclient/releases/latest/download/regctl-linux-amd64 -o /tmp/regctl-install/regctl
+          chmod +x /tmp/regctl-install/regctl
+          sudo mv /tmp/regctl-install/regctl /usr/local/bin/regctl
+
+      - name: Verify OCI annotations at every applicable level
         run: |
           TARGETS_INFO='${{ needs.prepare.outputs.targets_json }}'
           TARGETS=$(echo "$TARGETS_INFO" | jq -r 'keys[]')
@@ -329,10 +422,39 @@ jobs:
             echo "=== Inspecting images for target: $TARGET ==="
             
             TAGS=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].tags[]')
+            PLATFORMS=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].platforms[]')
+            PLATFORM_COUNT=$(echo "$PLATFORMS" | wc -l)
             
             for TAG in $TAGS; do
               echo ""
               echo "Image: $TAG"
-              docker buildx imagetools inspect "$TAG" || echo "Failed to inspect $TAG"
+              
+              EXPECTED=$(echo "$TARGETS_INFO" | jq -c --arg target "$TARGET" '.[$target].annotations')
+              verify_annotations() {
+                local level="$1"
+                local manifest="$2"
+                echo "  Verifying $level"
+                echo "$manifest" | jq -e --argjson expected "$EXPECTED" '
+                  (.annotations // {}) as $actual
+                  | all($expected | to_entries[]; $actual[.key] == .value)' > /dev/null
+              }
+
+              if [ "$PLATFORM_COUNT" -gt 1 ]; then
+                INDEX=$(regctl manifest get "$TAG" --format raw-body)
+                verify_annotations "OCI index" "$INDEX"
+                while IFS= read -r DESCRIPTOR; do
+                  DESCRIPTOR_PLATFORM=$(echo "$DESCRIPTOR" | jq -r '
+                    if .platform then (.platform.os + "/" + .platform.architecture) else "unspecified" end')
+                  verify_annotations "descriptor for $DESCRIPTOR_PLATFORM" "$DESCRIPTOR"
+                done < <(echo "$INDEX" | jq -c '.manifests[]')
+                for PLATFORM in $PLATFORMS; do
+                  IMAGE_MANIFEST=$(regctl manifest get "$TAG" --platform="$PLATFORM" --format raw-body)
+                  verify_annotations "image manifest for $PLATFORM" "$IMAGE_MANIFEST"
+                done
+              else
+                PLATFORM=$(echo "$PLATFORMS" | head -n 1)
+                IMAGE_MANIFEST=$(regctl manifest get "$TAG" --platform="$PLATFORM" --format raw-body)
+                verify_annotations "single-architecture image manifest" "$IMAGE_MANIFEST"
+              fi
             done
           done
