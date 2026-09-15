@@ -368,9 +368,18 @@ jobs:
                 docker buildx imagetools create --prefer-index=true -t "$TAG" "${TAG_SOURCES[@]}"
 
                 INDEX=$(regctl manifest get "$TAG" --format raw-body)
-                echo "$INDEX" | jq --argjson annotations "$ANNOTATIONS" \
-                  '.annotations = $annotations | .manifests |= map(.annotations = $annotations)' \
-                  | regctl manifest put "$TAG"
+                for ATTEMPT in 1 2 3; do
+                  if echo "$INDEX" | jq --argjson annotations "$ANNOTATIONS" \
+                    '.annotations = $annotations | .manifests |= map(.annotations = $annotations)' \
+                    | regctl manifest put "$TAG"; then
+                    break
+                  fi
+                  if [ "$ATTEMPT" -eq 3 ]; then
+                    echo "ERROR: Failed to write OCI annotations for $TAG after $ATTEMPT attempts"
+                    exit 1
+                  fi
+                  sleep $((ATTEMPT * 2))
+                done
               done
             else
               # Single platform: image already pushed during build, manifest not needed.
