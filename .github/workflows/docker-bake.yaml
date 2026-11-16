@@ -139,7 +139,6 @@ jobs:
     needs: prepare
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include: ${{ fromJson(needs.prepare.outputs.matrix) }}
     runs-on: ${{ startsWith(matrix.platform, 'linux/arm') && inputs.runner-arm64 || inputs.runner-amd64 }}
@@ -404,7 +403,6 @@ jobs:
       - merge
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         include: ${{ fromJson(needs.prepare.outputs.matrix) }}
     # Match the image architecture in case a future scanner step needs native execution.
