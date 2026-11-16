@@ -23,6 +23,14 @@ on:
         description: 'Runner to use for arm64 builds'
         type: string
         default: 'ubuntu-24.04-arm'
+      fail-on-scan-findings:
+        description: 'Fail the workflow at the end if Trivy reports findings'
+        type: boolean
+        default: true
+      trivyignore-file:
+        description: 'Path to the Trivy ignore file in the calling repository'
+        type: string
+        default: '.trivyignore'
     secrets:
       dockerhub_username:
         description: 'DockerHub username'
@@ -389,13 +397,278 @@ jobs:
             done
           done
 
+  scan:
+    needs:
+      - prepare
+      - merge
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    # Match the image architecture in case a future scanner step needs native execution.
+    runs-on: ${{ startsWith(matrix.platform, 'linux/arm') && inputs.runner-arm64 || inputs.runner-amd64 }}
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+
+      - name: Prepare scan variables
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Install oras and regctl
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) ARCH=amd64 ;;
+            aarch64) ARCH=arm64 ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m)"
+              exit 1
+              ;;
+          esac
+
+          ORAS_VERSION=1.3.0
+          ORAS_ARCHIVE="$RUNNER_TEMP/oras_${ORAS_VERSION}_linux_${ARCH}.tar.gz"
+          curl -fL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ARCH}.tar.gz" \
+            -o "$ORAS_ARCHIVE"
+          tar -xzf "$ORAS_ARCHIVE" -C /usr/local/bin oras
+
+          curl -fL "https://github.com/regclient/regclient/releases/latest/download/regctl-linux-${ARCH}" \
+            -o "$RUNNER_TEMP/regctl"
+          chmod +x "$RUNNER_TEMP/regctl"
+          sudo mv "$RUNNER_TEMP/regctl" /usr/local/bin/regctl
+
+      - name: Scan platform image and create attestation
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGETS_JSON: ${{ needs.prepare.outputs.targets_json }}
+          TRIVY_IGNORE_FILE: ${{ inputs.trivyignore-file }}
+        run: |
+          set -euo pipefail
+
+          TAG=$(echo "$TARGETS_JSON" | jq -r --arg target "$TARGET" '.[$target].tags[0]')
+          REPO="${TAG%:*}"
+          PLATFORM_DIGEST=$(regctl manifest get "$TAG" \
+            --platform "$PLATFORM" --format '{{.GetDescriptor.Digest}}')
+
+          TRIVY_ARGS=(
+            image
+            --scanners vuln,secret,misconfig
+            --format json
+            --exit-code 0
+            --output trivy-results.json
+          )
+          if [ -f "$TRIVY_IGNORE_FILE" ]; then
+            echo "Using Trivy ignore file: $TRIVY_IGNORE_FILE"
+            TRIVY_ARGS+=(--ignorefile "$TRIVY_IGNORE_FILE")
+          else
+            echo "No Trivy ignore file at $TRIVY_IGNORE_FILE; proceeding without it"
+          fi
+
+          trivy "${TRIVY_ARGS[@]}" "$REPO@$PLATFORM_DIGEST"
+          jq '{scanner: {name: "Trivy", result: {Results: (.Results // [])}}}' \
+            trivy-results.json > vuln-predicate.json
+
+          HAS_FINDINGS=$(jq \
+            '[.scanner.result.Results[]? |
+              (.Vulnerabilities[]?, .Secrets[]?, .Misconfigurations[]?)] | length > 0' \
+            vuln-predicate.json)
+          echo "has_findings=$HAS_FINDINGS" > findings-status.txt
+
+          DIGEST_HASH="${PLATFORM_DIGEST#sha256:}"
+          jq -n \
+            --arg type "https://in-toto.io/Statement/v1" \
+            --arg predType "https://aquasecurity.github.io/trivy/attestation/scan/v1" \
+            --arg name "$REPO" \
+            --arg digest "$DIGEST_HASH" \
+            --slurpfile predicate vuln-predicate.json \
+            '{
+              "_type": $type,
+              "subject": [{"name": $name, "digest": {"sha256": $digest}}],
+              "predicateType": $predType,
+              "predicate": $predicate[0]
+            }' > statement.json
+
+          oras attach \
+            --distribution-spec v1.1-referrers-tag \
+            --artifact-type "application/vnd.in-toto+json" \
+            --annotation "in-toto.io/predicate-type=https://aquasecurity.github.io/trivy/attestation/scan/v1" \
+            "$REPO@$PLATFORM_DIGEST" \
+            statement.json:application/vnd.in-toto+json
+
+      - name: Upload scan findings
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-findings-${{ needs.prepare.outputs.instance_id }}-${{ matrix.target }}-${{ env.PLATFORM_PAIR }}
+          path: |
+            findings-status.txt
+            vuln-predicate.json
+          if-no-files-found: error
+          retention-days: 1
+
+  scan-summary:
+    needs:
+      - prepare
+      - scan
+    runs-on: ubuntu-latest
+    outputs:
+      has_findings: ${{ steps.aggregate.outputs.has_findings }}
+    steps:
+      - name: Download scan findings
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/scan-findings
+          pattern: scan-findings-${{ needs.prepare.outputs.instance_id }}-*
+          merge-multiple: false
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.dockerhub_username }}
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: Install oras and regctl
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) ARCH=amd64 ;;
+            aarch64) ARCH=arm64 ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m)"
+              exit 1
+              ;;
+          esac
+
+          ORAS_VERSION=1.3.0
+          ORAS_ARCHIVE="$RUNNER_TEMP/oras_${ORAS_VERSION}_linux_${ARCH}.tar.gz"
+          curl -fL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ARCH}.tar.gz" \
+            -o "$ORAS_ARCHIVE"
+          tar -xzf "$ORAS_ARCHIVE" -C /usr/local/bin oras
+
+          curl -fL "https://github.com/regclient/regclient/releases/latest/download/regctl-linux-${ARCH}" \
+            -o "$RUNNER_TEMP/regctl"
+          chmod +x "$RUNNER_TEMP/regctl"
+          sudo mv "$RUNNER_TEMP/regctl" /usr/local/bin/regctl
+
+      - name: Aggregate findings and attest OCI indexes
+        id: aggregate
+        env:
+          TARGETS_JSON: ${{ needs.prepare.outputs.targets_json }}
+          INSTANCE_ID: ${{ needs.prepare.outputs.instance_id }}
+          SCAN_FINDINGS_DIR: ${{ runner.temp }}/scan-findings
+        run: |
+          set -euo pipefail
+
+          TARGETS=$(echo "$TARGETS_JSON" | jq -r 'keys[]')
+          SUMMARY_JSON='{"targets":[],"totals":{"vulnerabilitiesBySeverity":{},"totalVulnerabilities":0,"secrets":0,"misconfigurations":0}}'
+          HAS_FINDINGS=false
+
+          for TARGET in $TARGETS; do
+            TARGET_SUMMARY='{"platforms":[],"totals":{"vulnerabilitiesBySeverity":{},"totalVulnerabilities":0,"secrets":0,"misconfigurations":0}}'
+            PLATFORMS=$(echo "$TARGETS_JSON" | jq -r --arg target "$TARGET" '.[$target].platforms[]')
+
+            for PLATFORM in $PLATFORMS; do
+              PLATFORM_PAIR="${PLATFORM//\//-}"
+              ARTIFACT_DIR="$SCAN_FINDINGS_DIR/scan-findings-${INSTANCE_ID}-${TARGET}-${PLATFORM_PAIR}"
+              PREDICATE="$ARTIFACT_DIR/vuln-predicate.json"
+              STATUS_FILE="$ARTIFACT_DIR/findings-status.txt"
+
+              if [ ! -f "$PREDICATE" ] || [ ! -f "$STATUS_FILE" ]; then
+                echo "ERROR: Scan findings missing for $TARGET/$PLATFORM"
+                exit 1
+              fi
+              if grep -q '^has_findings=true$' "$STATUS_FILE"; then
+                HAS_FINDINGS=true
+              fi
+
+              COUNTS=$(jq -c '{
+                vulnerabilitiesBySeverity: ([.scanner.result.Results[]?.Vulnerabilities[]?]
+                  | group_by(.Severity)
+                  | map({(.[0].Severity): length}) | add // {}),
+                totalVulnerabilities: ([.scanner.result.Results[]?.Vulnerabilities[]?] | length),
+                secrets: ([.scanner.result.Results[]?.Secrets[]?] | length),
+                misconfigurations: ([.scanner.result.Results[]?.Misconfigurations[]?] | length)
+              }' "$PREDICATE")
+              TARGET_SUMMARY=$(echo "$TARGET_SUMMARY" | jq -c \
+                --arg platform "$PLATFORM" --argjson counts "$COUNTS" '
+                .platforms += [$counts + {platform: $platform}]
+                | .totals.vulnerabilitiesBySeverity |=
+                    reduce ($counts.vulnerabilitiesBySeverity | to_entries[]) as $severity
+                      (. ; .[$severity.key] = ((.[$severity.key] // 0) + $severity.value))
+                | .totals.totalVulnerabilities += $counts.totalVulnerabilities
+                | .totals.secrets += $counts.secrets
+                | .totals.misconfigurations += $counts.misconfigurations')
+            done
+
+            TARGET_SUMMARY=$(echo "$TARGET_SUMMARY" | jq -c --arg target "$TARGET" '. + {target: $target}')
+            SUMMARY_JSON=$(echo "$SUMMARY_JSON" | jq -c --argjson target_summary "$TARGET_SUMMARY" '
+              .targets += [$target_summary]
+              | .totals.totalVulnerabilities += $target_summary.totals.totalVulnerabilities
+              | .totals.secrets += $target_summary.totals.secrets
+              | .totals.misconfigurations += $target_summary.totals.misconfigurations
+              | .totals.vulnerabilitiesBySeverity |=
+                  reduce ($target_summary.totals.vulnerabilitiesBySeverity | to_entries[]) as $severity
+                    (. ; .[$severity.key] = ((.[$severity.key] // 0) + $severity.value))')
+          done
+
+          echo "has_findings=$HAS_FINDINGS" >> "$GITHUB_OUTPUT"
+          echo "$SUMMARY_JSON" | jq .
+
+          for TARGET in $TARGETS; do
+            TARGET_SUMMARY=$(echo "$SUMMARY_JSON" | jq -c --arg target "$TARGET" \
+              '.targets[] | select(.target == $target)')
+            TAGS=$(echo "$TARGETS_JSON" | jq -r --arg target "$TARGET" '.[$target].tags[]')
+
+            for TAG in $TAGS; do
+              REPO="${TAG%:*}"
+              INDEX_DIGEST=$(regctl manifest get "$TAG" --format '{{.GetDescriptor.Digest}}')
+              DIGEST_HASH="${INDEX_DIGEST#sha256:}"
+              jq -n \
+                --arg type "https://in-toto.io/Statement/v1" \
+                --arg predType "https://aquasecurity.github.io/trivy/attestation/scan-summary/v1" \
+                --arg name "$REPO" \
+                --arg digest "$DIGEST_HASH" \
+                --argjson summary "$TARGET_SUMMARY" \
+                '{
+                  "_type": $type,
+                  "subject": [{"name": $name, "digest": {"sha256": $digest}}],
+                  "predicateType": $predType,
+                  "predicate": $summary
+                }' > index-statement.json
+
+              oras attach \
+                --distribution-spec v1.1-referrers-tag \
+                --artifact-type "application/vnd.in-toto+json" \
+                --annotation "in-toto.io/predicate-type=https://aquasecurity.github.io/trivy/attestation/scan-summary/v1" \
+                --annotation "scan-level=index-summary" \
+                "$REPO@$INDEX_DIGEST" \
+                index-statement.json:application/vnd.in-toto+json
+            done
+          done
+
   verify:
-    if: ${{ always() && needs.prepare.result == 'success' && needs.build.result == 'success' && needs.merge.result == 'success' }}
+    if: ${{ always() && needs.prepare.result == 'success' && needs.build.result == 'success' && needs.merge.result == 'success' && needs.scan-summary.result == 'success' }}
     runs-on: ubuntu-latest
     needs:
       - prepare
       - build
       - merge
+      - scan-summary
     steps:
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -409,6 +682,24 @@ jobs:
           curl -L https://github.com/regclient/regclient/releases/latest/download/regctl-linux-amd64 -o /tmp/regctl-install/regctl
           chmod +x /tmp/regctl-install/regctl
           sudo mv /tmp/regctl-install/regctl /usr/local/bin/regctl
+
+      - name: Install oras
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64) ARCH=amd64 ;;
+            aarch64) ARCH=arm64 ;;
+            *)
+              echo "Unsupported runner architecture: $(uname -m)"
+              exit 1
+              ;;
+          esac
+
+          ORAS_VERSION=1.3.0
+          ORAS_ARCHIVE="$RUNNER_TEMP/oras_${ORAS_VERSION}_linux_${ARCH}.tar.gz"
+          curl -fL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_${ARCH}.tar.gz" \
+            -o "$ORAS_ARCHIVE"
+          tar -xzf "$ORAS_ARCHIVE" -C /usr/local/bin oras
 
       - name: Verify OCI annotations at all 3 levels (Index, Descriptors, Image Manifests)
         run: |
@@ -426,6 +717,7 @@ jobs:
             for TAG in $TAGS; do
               echo ""
               echo "Image: $TAG"
+              REPO="${TAG%:*}"
               
               verify_annotations() {
                 local level="$1"
@@ -472,6 +764,143 @@ jobs:
               for PLATFORM in $PLATFORMS; do
                 IMAGE_MANIFEST=$(regctl manifest get "$TAG" --platform="$PLATFORM" --format raw-body)
                 verify_annotations "Level 3 Image Manifest for $PLATFORM" "$IMAGE_MANIFEST"
+
+                PLATFORM_DIGEST=$(regctl manifest get "$TAG" \
+                  --platform "$PLATFORM" --format '{{.GetDescriptor.Digest}}')
+                REFERRERS=$(regctl artifact list "$REPO@$PLATFORM_DIGEST" \
+                  --slow-referrers \
+                  --filter-artifact-type "application/vnd.in-toto+json" \
+                  --format '{{len .Manifest.Manifests}}')
+                if [ "$REFERRERS" -lt 1 ]; then
+                  echo "ERROR: No scan attestation referrer found for $PLATFORM_DIGEST"
+                  exit 1
+                fi
+                echo "    ✓ Scan attestation referrer found for $PLATFORM"
               done
+
+              INDEX_DIGEST=$(regctl manifest get "$TAG" --format '{{.GetDescriptor.Digest}}')
+              REFERRERS=$(regctl artifact list "$REPO@$INDEX_DIGEST" \
+                --slow-referrers \
+                --filter-artifact-type "application/vnd.in-toto+json" \
+                --format '{{len .Manifest.Manifests}}')
+              if [ "$REFERRERS" -lt 1 ]; then
+                echo "ERROR: No scan summary attestation referrer found for index $INDEX_DIGEST"
+                exit 1
+              fi
+              echo "    ✓ Scan summary attestation referrer found for index"
             done
           done
+
+      - name: Verify scan attestation statements
+        env:
+          TARGETS_INFO: ${{ needs.prepare.outputs.targets_json }}
+        run: |
+          set -euo pipefail
+
+          verify_statement() {
+            local subject_ref="$1"
+            local subject_digest="$2"
+            local predicate_type="$3"
+            local statement_kind="$4"
+            local digest_hash="${subject_digest#sha256:}"
+            local subject_ref_repo="${subject_ref%@*}"
+            local referrer_digest
+            local output_dir
+            local statement_file
+
+            referrer_digest=$(oras discover \
+              --distribution-spec v1.1-referrers-tag \
+              --format json \
+              --depth 1 \
+              --artifact-type application/vnd.in-toto+json \
+              "$subject_ref" \
+              | jq -r --arg predicate_type "$predicate_type" \
+                  '.referrers[]? | select(.annotations["in-toto.io/predicate-type"] == $predicate_type) | .digest' \
+              | sed -n '1p')
+            if [ -z "$referrer_digest" ]; then
+              echo "ERROR: No $statement_kind attestation discoverable for $subject_ref"
+              exit 1
+            fi
+
+            output_dir=$(mktemp -d "$RUNNER_TEMP/attestation-${statement_kind}-${digest_hash}-XXXXXX")
+            oras pull "$subject_ref_repo@$referrer_digest" --output "$output_dir"
+            statement_file=$(find "$output_dir" -type f -name '*.json' -print -quit)
+            if [ -z "$statement_file" ]; then
+              echo "ERROR: No JSON statement found in $statement_kind attestation $referrer_digest"
+              exit 1
+            fi
+
+            if [ "$statement_kind" = "platform" ]; then
+              jq -e \
+                --arg digest "$digest_hash" \
+                --arg predicate_type "$predicate_type" \
+                '._type == "https://in-toto.io/Statement/v1"
+                 and .predicateType == $predicate_type
+                 and .subject[0].digest.sha256 == $digest
+                 and .predicate.scanner.name == "Trivy"
+                 and (.predicate.scanner.result.Results | type == "array")' \
+                "$statement_file" >/dev/null
+            else
+              jq -e \
+                --arg digest "$digest_hash" \
+                --arg predicate_type "$predicate_type" \
+                '._type == "https://in-toto.io/Statement/v1"
+                 and .predicateType == $predicate_type
+                 and .subject[0].digest.sha256 == $digest
+                 and (.predicate.platforms | type == "array")
+                 and (.predicate.totals | type == "object")' \
+                "$statement_file" >/dev/null
+            fi
+            echo "    ✓ Valid $statement_kind in-toto scan attestation for $subject_ref"
+          }
+
+          TARGETS=$(echo "$TARGETS_INFO" | jq -r 'keys[]')
+          for TARGET in $TARGETS; do
+            TAGS=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].tags[]')
+            PLATFORMS=$(echo "$TARGETS_INFO" | jq -r --arg target "$TARGET" '.[$target].platforms[]')
+
+            for TAG in $TAGS; do
+              REPO="${TAG%:*}"
+              for PLATFORM in $PLATFORMS; do
+                PLATFORM_DIGEST=$(regctl manifest get "$TAG" \
+                  --platform "$PLATFORM" --format '{{.GetDescriptor.Digest}}')
+                subject_ref="$REPO@$PLATFORM_DIGEST"
+                verify_statement "$subject_ref" "$PLATFORM_DIGEST" \
+                  "https://aquasecurity.github.io/trivy/attestation/scan/v1" platform
+              done
+
+              INDEX_DIGEST=$(regctl manifest get "$TAG" --format '{{.GetDescriptor.Digest}}')
+              subject_ref="$REPO@$INDEX_DIGEST"
+              verify_statement "$subject_ref" "$INDEX_DIGEST" \
+                "https://aquasecurity.github.io/trivy/attestation/scan-summary/v1" index
+            done
+          done
+
+  gate:
+    if: >-
+      ${{ always()
+          && needs.prepare.result == 'success'
+          && needs.build.result == 'success'
+          && needs.merge.result == 'success'
+          && needs.scan.result == 'success'
+          && needs.scan-summary.result == 'success'
+          && needs.verify.result == 'success' }}
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - build
+      - merge
+      - scan
+      - scan-summary
+      - verify
+    steps:
+      - name: Enforce scan findings policy
+        env:
+          FAIL_ON_SCAN_FINDINGS: ${{ inputs.fail-on-scan-findings }}
+          HAS_FINDINGS: ${{ needs.scan-summary.outputs.has_findings }}
+        run: |
+          if [ "$FAIL_ON_SCAN_FINDINGS" = "true" ] && [ "$HAS_FINDINGS" = "true" ]; then
+            echo "::error::Trivy scan findings detected. Failing because fail-on-scan-findings is enabled."
+            exit 1
+          fi
+          echo "No findings or fail-on-scan-findings is disabled. Passing."
